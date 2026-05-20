@@ -7,11 +7,9 @@ replication requests and completion status in a PostgreSQL database.
 
 import logging
 import json
-import os
 import time
 import hashlib
-from datetime import datetime
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 from dataclasses import dataclass
 from enum import Enum
 
@@ -62,7 +60,7 @@ class ReplicationStatus(Enum):
     """Enumeration of replication statuses."""
     PENDING = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
-    COMPLETED = "COMPLETED" 
+    COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
 
@@ -93,15 +91,9 @@ class ReplicationConfig:
     postgres_database: str = "s3_replication"
     postgres_user: str = "postgres"
     postgres_password: str = ""
-    source_prefix: Optional[str] = None
-    dest_prefix: Optional[str] = None
     aws_region: str = "us-east-1"
-    aws_access_key_id: Optional[str] = None
-    aws_secret_access_key: Optional[str] = None
-    use_databricks_secrets: bool = True
-    databricks_secret_scope: str = "s3-replication"
-    databricks_access_key_secret: str = "aws-access-key-id"
-    databricks_secret_key_secret: str = "aws-secret-access-key"
+    source_external_location_path: Optional[str] = None
+    dest_external_location_path: Optional[str] = None
     db_table: str = "replication_requests"
     batch_size: int = 100
     """
@@ -130,24 +122,18 @@ class ReplicationConfig:
     """Schema name for replication tables. Used for validation and organization."""
 
 
-def get_aws_credentials_from_databricks(
-    scope: str,
-    access_key_secret: str,
-    secret_key_secret: str
-) -> Tuple[str, str]:
+def get_temporary_path_credentials(path: str):
     """
-    Retrieve AWS credentials from Databricks Secret Scope.
+    Retrieve temporary path-scoped AWS credentials from Unity Catalog.
     
     Args:
-        scope: Databricks secret scope name
-        access_key_secret: Secret name for AWS access key ID
-        secret_key_secret: Secret name for AWS secret access key
+        path: S3 path mapped to a Unity Catalog External Location
         
     Returns:
-        Tuple of (access_key_id, secret_access_key)
+        Temporary credential object with access_key_id, secret_access_key, session_token
         
     Raises:
-        RuntimeError: If Databricks SDK is not available or secrets cannot be retrieved
+        RuntimeError: If Databricks SDK is not available or credentials cannot be generated
     """
     if not DATABRICKS_AVAILABLE:
         raise RuntimeError(
@@ -155,14 +141,13 @@ def get_aws_credentials_from_databricks(
         )
     
     try:
-        logger.debug(f"Attempting to retrieve AWS credentials from Databricks scope: {scope}")
+        logger.debug(f"Requesting temporary path credentials for: {path}")
         ws = WorkspaceClient()
-        access_key = ws.secrets.get_secret(scope=scope, key=access_key_secret).value
-        secret_key = ws.secrets.get_secret(scope=scope, key=secret_key_secret).value
-        logger.info("Successfully retrieved AWS credentials from Databricks secrets")
-        return access_key, secret_key
+        temp_cred = ws.temporary_path_credentials.generate_temporary_path_credentials(path=path)
+        logger.info("Successfully generated temporary path credentials")
+        return temp_cred
     except Exception as e:
-        logger.error(f"Failed to retrieve AWS credentials from Databricks secrets: {e}", exc_info=True)
+        logger.error(f"Failed to generate temporary path credentials: {e}", exc_info=True)
         raise
 
 
@@ -187,7 +172,8 @@ class S3ReplicationService:
             RuntimeError: If initialization fails
         """
         self.config = config
-        self.s3_client = None
+        self.source_s3_client = None
+        self.dest_s3_client = None
         self.connection_pool = None
         
         # Validate table name to prevent SQL injection
@@ -198,36 +184,31 @@ class S3ReplicationService:
             )
         
         try:
-            # Get AWS credentials
-            if config.use_databricks_secrets:
-                try:
-                    access_key, secret_key = get_aws_credentials_from_databricks(
-                        config.databricks_secret_scope,
-                        config.databricks_access_key_secret,
-                        config.databricks_secret_key_secret
-                    )
-                except RuntimeError as e:
-                    logger.error(f"Failed to get AWS credentials from Databricks: {e}")
-                    raise
-            else:
-                # Fall back to config or environment variables
-                access_key = config.aws_access_key_id or os.environ.get('AWS_ACCESS_KEY_ID')
-                secret_key = config.aws_secret_access_key or os.environ.get('AWS_SECRET_ACCESS_KEY')
-                
-                if not access_key or not secret_key:
-                    raise ValueError(
-                        "AWS credentials not found. Either configure use_databricks_secrets=True "
-                        "or provide aws_access_key_id and aws_secret_access_key"
-                    )
-            
-            # Initialize S3 client with credentials
-            self.s3_client = boto3.client(
-                's3',
-                region_name=config.aws_region,
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key
+            if not config.source_external_location_path or not config.dest_external_location_path:
+                raise ValueError(
+                    "source_external_location_path and dest_external_location_path are required "
+                    "for Unity Catalog temporary path credentials"
+                )
+
+            source_temp_cred = get_temporary_path_credentials(config.source_external_location_path)
+            dest_temp_cred = get_temporary_path_credentials(config.dest_external_location_path)
+
+            source_session = boto3.Session(
+                aws_access_key_id=source_temp_cred.access_key_id,
+                aws_secret_access_key=source_temp_cred.secret_access_key,
+                aws_session_token=source_temp_cred.session_token,
+                region_name=config.aws_region
             )
-            logger.info(f"Initialized S3 client for region {config.aws_region}")
+            dest_session = boto3.Session(
+                aws_access_key_id=dest_temp_cred.access_key_id,
+                aws_secret_access_key=dest_temp_cred.secret_access_key,
+                aws_session_token=dest_temp_cred.session_token,
+                region_name=config.aws_region
+            )
+
+            self.source_s3_client = source_session.client('s3')
+            self.dest_s3_client = dest_session.client('s3')
+            logger.info(f"Initialized source and destination S3 clients for region {config.aws_region}")
             
             # Initialize PostgreSQL connection pool
             self.connection_pool = SimpleConnectionPool(
@@ -401,7 +382,7 @@ class S3ReplicationService:
         else:
             logger.info(f"Schema already at version {current_version}")
 
-    def _get_s3_object_metadata(self, bucket: str, key: str) -> Optional[Dict]:
+    def _get_s3_object_metadata(self, bucket: str, key: str, s3_client=None) -> Optional[Dict]:
         """
         Retrieve metadata for an S3 object with proper error categorization.
         
@@ -419,7 +400,8 @@ class S3ReplicationService:
             ReplicationError: For other unexpected errors
         """
         try:
-            response = self.s3_client.head_object(Bucket=bucket, Key=key)
+            client = s3_client or self.source_s3_client
+            response = client.head_object(Bucket=bucket, Key=key)
             return {
                 'size': response.get('ContentLength'),
                 'etag': response.get('ETag', '').strip('"'),
@@ -441,7 +423,7 @@ class S3ReplicationService:
                 logger.error(f"Unexpected S3 error for s3://{bucket}/{key}: {error_code}")
                 raise ReplicationError(f"S3 error: {error_code}") from e
 
-    def _compute_file_checksum(self, bucket: str, key: str, algorithm: str = 'sha256') -> str:
+    def _compute_file_checksum(self, bucket: str, key: str, algorithm: str = 'sha256', s3_client=None) -> str:
         """
         Compute checksum of S3 object by streaming download.
         
@@ -464,7 +446,8 @@ class S3ReplicationService:
         
         try:
             logger.debug(f"Computing {algorithm} checksum for s3://{bucket}/{key}")
-            response = self.s3_client.get_object(Bucket=bucket, Key=key)
+            client = s3_client or self.source_s3_client
+            response = client.get_object(Bucket=bucket, Key=key)
             
             # Stream file in 1MB chunks to avoid memory issues
             for chunk in iter(lambda: response['Body'].read(1024 * 1024), b''):
@@ -502,18 +485,20 @@ class S3ReplicationService:
 
             # Copy object from source to destination
             copy_source = {'Bucket': request.source_bucket, 'Key': request.source_key}
-            self.s3_client.copy_object(
+            self.dest_s3_client.copy(
                 CopySource=copy_source,
                 Bucket=request.dest_bucket,
                 Key=request.dest_key,
-                ServerSideEncryption='AES256'
+                SourceClient=self.source_s3_client,
+                ExtraArgs={'ServerSideEncryption': 'AES256'}
             )
 
             # Verify replication by checking destination object
             try:
                 dest_metadata = self._get_s3_object_metadata(
                     request.dest_bucket, 
-                    request.dest_key
+                    request.dest_key,
+                    s3_client=self.dest_s3_client
                 )
             except TransientReplicationError:
                 raise  # Propagate transient errors for retry
@@ -911,12 +896,13 @@ class S3ReplicationService:
                 logger.error(f"Error closing connection pool: {e}")
                 errors.append(e)
         
-        if self.s3_client:
+        for label, client in (("source", self.source_s3_client), ("destination", self.dest_s3_client)):
             try:
-                self.s3_client.close()
-                logger.info("Closed S3 client")
+                if client:
+                    client.close()
+                    logger.info(f"Closed {label} S3 client")
             except Exception as e:
-                logger.error(f"Error closing S3 client: {e}")
+                logger.error(f"Error closing {label} S3 client: {e}")
                 errors.append(e)
         
         if errors:
@@ -926,7 +912,7 @@ class S3ReplicationService:
 def main():
     """Main entry point for the S3 replication job."""
     
-    # Configuration with Databricks secrets
+    # Configuration with Unity Catalog temporary path credentials
     config = ReplicationConfig(
         source_bucket="prod-ereg-bucket",
         dest_bucket="dev-ereg-replica",
@@ -935,13 +921,9 @@ def main():
         postgres_database="s3_replication",
         postgres_user="postgres",
         postgres_password="your_password_here",
-        source_prefix="instance1/",
-        dest_prefix="replicated/instance1/",
         aws_region="us-east-1",
-        use_databricks_secrets=True,
-        databricks_secret_scope="s3-replication",
-        databricks_access_key_secret="aws-access-key-id",
-        databricks_secret_key_secret="aws-secret-access-key",
+        source_external_location_path="s3://prod-ereg-bucket/",
+        dest_external_location_path="s3://dev-ereg-replica/",
         batch_size=100,
         max_retries=3
     )
@@ -950,7 +932,7 @@ def main():
     try:
         # Initialize service
         service = S3ReplicationService(config)
-        logger.info("S3 Replication Service initialized with Databricks secrets")
+        logger.info("S3 Replication Service initialized with Unity Catalog temporary credentials")
 
         # Process pending replication requests
         successful = service.process_pending_requests()
@@ -971,4 +953,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
