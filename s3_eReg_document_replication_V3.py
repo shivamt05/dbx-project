@@ -1,0 +1,549 @@
+# Databricks notebook source
+import logging
+import time
+import os
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# COMMAND ----------
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ReplicationConfig:
+    # S3 source settings
+    source_bucket: str = "qa-ereg-us-east-2-ses-qa-ereg"
+    source_prefix: str = "sw1-qa-ereg"           # s3://<bucket>/<prefix>/<uuid>/
+
+    # Destination: Databricks Volume path
+    dest_volume_path: str = "/Volumes/dbx_dev_data_refine/export/ereg/s3_replication/eReg_QA"
+
+    # Silver table that drives replication
+    silver_table: str = "dbx_dev_data_refine.ereg_silver.s3_file"
+
+    # Delta tracking table
+    tracking_schema: str = "dbx_dev_data_refine.export"
+    tracking_table: str  = "s3_replication_requests"
+
+    # ── Scalability knobs ──────────────────────────────────────────────────────
+    batch_size: int       = 500   # how many UUID folders to pick per run
+    max_retries: int      = 3     # retry attempts per UUID on transient errors
+    uuid_workers: int     = 20    # parallel threads for UUID-level processing
+    file_workers: int     = 10    # parallel threads for file copies within a UUID
+
+# COMMAND ----------
+
+# ── Status & Errors ────────────────────────────────────────────────────────────
+
+class ReplicationStatus(Enum):
+    PENDING     = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED   = "COMPLETED"
+    FAILED      = "FAILED"
+    SKIPPED     = "SKIPPED"   # UUID folder missing or empty in S3
+
+
+class TransientError(Exception):
+    pass
+
+class PermanentError(Exception):
+    pass
+
+# COMMAND ----------
+
+# ── S3 Helpers (via dbutils — Unity Catalog handles auth) ─────────────────────
+
+def list_s3_files_dbutils(bucket: str, prefix: str) -> Tuple[list, Optional[str]]:
+    """
+    List all files under an S3 prefix using dbutils.fs.ls.
+    Unity Catalog external location handles credentials automatically.
+
+    Returns (files, skip_reason):
+        files       : list of dicts — 'path', 'name', 'size'
+        skip_reason : None if files found, otherwise one of:
+                      "UUID folder not found in S3"
+                      "UUID folder exists but is empty in S3"
+    """
+    s3_path = f"s3://{bucket}/{prefix}"
+    try:
+        items = dbutils.fs.ls(s3_path)
+    except Exception as e:
+        logger.warning(f"UUID folder not found in S3 at {s3_path}: {e}")
+        return [], "UUID folder not found in S3"
+
+    files = [
+        {'path': item.path, 'name': item.name, 'size': item.size}
+        for item in items
+        if not item.name.endswith('/')     # skip folder placeholder entries
+    ]
+
+    if not files:
+        logger.warning(f"UUID folder exists but is empty in S3 at {s3_path}")
+        return [], "UUID folder exists but is empty in S3"
+
+    return files, None
+
+
+def copy_file_to_volume(src_path: str, dest_path: str) -> int:
+    """
+    Copy a single file from S3 to a Volume path using dbutils.fs.cp.
+    Returns bytes copied, or -1 if the file already exists (idempotent skip).
+    Thread-safe — each call works on a different file path.
+    """
+    # Idempotency check — skip if already at destination
+    if os.path.exists(dest_path):
+        logger.debug(f"Already exists, skipping: {dest_path}")
+        return -1
+
+    # Ensure the UUID subfolder exists under the Volume
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+    dbutils.fs.cp(src_path, dest_path)
+
+    bytes_written = os.path.getsize(dest_path)
+    logger.debug(f"Copied {src_path} -> {dest_path} ({bytes_written} bytes)")
+    return bytes_written
+
+# COMMAND ----------
+
+def classify_error(e: Exception):
+    """Classify an exception as transient (retryable) or permanent."""
+    msg = str(e).lower()
+    if any(kw in msg for kw in ['timeout', 'throttl', 'slow', 'unavailable', 'temporary']):
+        raise TransientError(str(e)) from e
+    raise PermanentError(str(e)) from e
+
+
+# COMMAND ----------
+
+# ── Delta Table Setup ──────────────────────────────────────────────────────────
+
+def init_tracking_table(config: ReplicationConfig):
+    """Create the Delta tracking table if it doesn't already exist."""
+    full_table = f"{config.tracking_schema}.{config.tracking_table}"
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {full_table} (
+            request_id          STRING    NOT NULL,  -- s3_file_id UUID
+            product_ins_id      BIGINT,
+            product_type        STRING,
+            file_name           STRING,
+            source_bucket       STRING    NOT NULL,
+            source_key          STRING    NOT NULL,  -- S3 folder prefix for this UUID
+            dest_path           STRING    NOT NULL,  -- Volume destination folder
+            status              STRING    NOT NULL,  -- PENDING/IN_PROGRESS/COMPLETED/FAILED/SKIPPED
+            files_copied        INT,
+            total_bytes         BIGINT,
+            error_message       STRING,              -- failure reason OR skip reason
+            retry_count         INT,
+            created_timestamp   TIMESTAMP NOT NULL,
+            started_timestamp   TIMESTAMP,
+            completed_timestamp TIMESTAMP
+        )
+        USING DELTA 
+        TBLPROPERTIES (
+            'delta.autoOptimize.optimizeWrite' = 'true',   -- auto-compact small files on write
+            'delta.autoOptimize.autoCompact'   = 'true'    -- auto-compact on read
+        )
+        COMMENT 'Tracks S3-to-Volume replication requests, populated from ereg_silver.s3_file'
+    """)
+    logger.info(f"Tracking table ready: {full_table}")
+
+
+# COMMAND ----------
+
+def populate_pending_requests(config: ReplicationConfig) -> int:
+    """
+    Insert NEW rows into the tracking table from the silver s3_file table.
+    Only inserts s3_file_ids not already tracked (any status) — fully idempotent.
+    Uses a single INSERT ... SELECT instead of row-by-row inserts for efficiency.
+    """
+    full_table = f"{config.tracking_schema}.{config.tracking_table}"
+
+    spark.sql(f"""
+        INSERT INTO {full_table}
+            (request_id, product_ins_id, product_type, file_name,
+             source_bucket, source_key, dest_path,
+             status, retry_count, created_timestamp)
+
+        SELECT
+            s.s3_file_id                                             AS request_id,
+            s.product_ins_id,
+            s.product_type,
+            s.file_name,
+            '{config.source_bucket}'                                 AS source_bucket,
+            '{config.source_prefix}/' || s.s3_file_id || '/'        AS source_key,
+            '{config.dest_volume_path}/' || s.s3_file_id || '/'     AS dest_path,
+            'PENDING'                                                 AS status,
+            0                                                         AS retry_count,
+            CURRENT_TIMESTAMP                                         AS created_timestamp
+
+        FROM {config.silver_table} s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {full_table} t
+            WHERE t.request_id = s.s3_file_id
+        )
+    """)
+
+    pending_count = spark.sql(f"""
+        SELECT COUNT(*) AS cnt FROM {full_table} WHERE status = 'PENDING'
+    """).collect()[0]['cnt']
+
+    logger.info(f"Pending requests ready to process: {pending_count}")
+    return pending_count
+
+
+
+# COMMAND ----------
+
+# ── Batch Status Update (key scalability change) ───────────────────────────────
+
+def batch_update_status(config: ReplicationConfig, results: list):
+    """
+    Write all status updates for the current batch in ONE single MERGE statement
+    instead of one UPDATE per UUID.
+
+    'results' is a list of dicts, each with:
+        request_id, status, files_copied, total_bytes, error_message
+    """
+    if not results:
+        return
+
+    full_table = f"{config.tracking_schema}.{config.tracking_table}"
+
+    # Build a VALUES list from all results
+    # e.g. ('uuid-1','COMPLETED',2,4096,NULL), ('uuid-2','FAILED',0,0,'Access denied')
+    values_rows = []
+    for r in results:
+        safe_error = (r.get('error_message') or '').replace("'", "''")
+        error_val  = f"'{safe_error}'" if safe_error else 'NULL'
+        files_val  = r.get('files_copied') if r.get('files_copied') is not None else 0
+        bytes_val  = r.get('total_bytes')  if r.get('total_bytes')  is not None else 0
+        values_rows.append(
+            f"('{r['request_id']}', '{r['status']}', {files_val}, {bytes_val}, {error_val})"
+        )
+
+    values_sql = ",\n        ".join(values_rows)
+
+    # Single MERGE covers all rows in the batch — far more efficient than
+    # individual UPDATE statements (avoids N separate Delta transactions)
+    spark.sql(f"""
+        MERGE INTO {full_table} AS target
+        USING (
+            SELECT
+                request_id,
+                status,
+                files_copied,
+                total_bytes,
+                error_message
+            FROM (VALUES
+                {values_sql}
+            ) AS t(request_id, status, files_copied, total_bytes, error_message)
+        ) AS source
+        ON target.request_id = source.request_id
+
+        WHEN MATCHED THEN UPDATE SET
+            target.status              = source.status,
+            target.files_copied        = source.files_copied,
+            target.total_bytes         = source.total_bytes,
+            target.error_message       = source.error_message,
+            target.completed_timestamp = CURRENT_TIMESTAMP
+    """)
+
+    logger.info(f"Batch status update complete for {len(results)} rows")
+
+# COMMAND ----------
+
+# ── Core: Replicate ONE UUID folder (runs inside a thread) ────────────────────
+
+def replicate_uuid_folder(config: ReplicationConfig, row: dict) -> dict:
+    """
+    Replicate all files under one UUID folder from S3 to the Volume.
+    Runs inside a ThreadPoolExecutor thread — must be thread-safe.
+
+    Returns a result dict:
+        request_id, status, files_copied, total_bytes, error_message
+    """
+    request_id    = row['request_id']
+    source_bucket = row['source_bucket']
+    source_prefix = row['source_key']    # "sw1-qa-ereg/<uuid>/"
+    dest_folder   = row['dest_path']     # "/Volumes/poc_cc/.../s3_replication/<uuid>/"
+
+    result = {
+        'request_id'   : request_id,
+        'status'       : ReplicationStatus.FAILED.value,
+        'files_copied' : 0,
+        'total_bytes'  : 0,
+        'error_message': None
+    }
+
+    for attempt in range(config.max_retries):
+        try:
+            # List all files under this UUID folder in S3
+            files, skip_reason = list_s3_files_dbutils(source_bucket, source_prefix)
+
+            if not files:
+                # UUID folder missing from S3 OR exists but empty — distinguish clearly
+                logger.warning(f"Skipping UUID {request_id}: {skip_reason}")
+                result['status']        = ReplicationStatus.SKIPPED.value
+                result['error_message'] = skip_reason
+                return result
+
+            # ── Parallel file copy within this UUID folder ─────────────────
+            # Uses a nested ThreadPoolExecutor so multiple files under one UUID
+            # are copied simultaneously instead of one-by-one
+            total_bytes  = 0
+            files_copied = 0
+            copy_errors  = []
+
+            with ThreadPoolExecutor(max_workers=config.file_workers) as file_executor:
+                future_to_file = {
+                    file_executor.submit(
+                        copy_file_to_volume,
+                        f['path'],
+                        dest_folder.rstrip('/') + '/' + f['name']
+                    ): f
+                    for f in files
+                }
+
+                for future in as_completed(future_to_file):
+                    f = future_to_file[future]
+                    try:
+                        bytes_written = future.result()
+                        if bytes_written == -1:
+                            logger.debug(f"Skipped existing file: {f['name']}")
+                        else:
+                            total_bytes  += bytes_written
+                            files_copied += 1
+                    except Exception as e:
+                        copy_errors.append(f"{f['name']}: {str(e)}")
+                        logger.error(f"Failed to copy {f['name']} for UUID {request_id}: {e}")
+
+            if copy_errors:
+                # Some files failed — mark UUID as FAILED with details
+                result['error_message'] = f"{len(copy_errors)} file(s) failed: {'; '.join(copy_errors[:3])}"
+                result['status']        = ReplicationStatus.FAILED.value
+                return result
+
+            result['status']        = ReplicationStatus.COMPLETED.value
+            result['files_copied']  = files_copied
+            result['total_bytes']   = total_bytes
+            return result
+
+        except Exception as e:
+            result['error_message'] = str(e)
+            try:
+                classify_error(e)
+            except TransientError:
+                if attempt < config.max_retries - 1:
+                    wait_time = 2 ** attempt    # 1s, 2s, 4s
+                    logger.warning(f"Transient error on {request_id}, retry {attempt+1} in {wait_time}s: {e}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Max retries exceeded for {request_id}: {e}")
+            except PermanentError:
+                logger.error(f"Permanent error on {request_id}: {e}")
+            break
+
+    return result
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Mark batch in-progress helper
+# ── Mark Batch In Progress ──────────────────────────────────────────────────────
+
+def mark_batch_in_progress(config: ReplicationConfig, request_ids: list):
+    """
+    Mark an entire batch of request_ids as IN_PROGRESS in one UPDATE statement.
+    This avoids N individual updates and reduces Delta transactions.
+    """
+    full_table = f"{config.tracking_schema}.{config.tracking_table}"
+    ids_csv = ", ".join(f"'{rid}'" for rid in request_ids)
+
+    spark.sql(f"""
+        UPDATE {full_table}
+        SET status = 'IN_PROGRESS',
+            started_timestamp = CURRENT_TIMESTAMP,
+            retry_count = retry_count + 1
+        WHERE request_id IN ({ids_csv})
+    """)
+
+    logger.info(f"Marked {len(request_ids)} requests as IN_PROGRESS")
+
+# COMMAND ----------
+
+# ── Main Processing Loop (parallel UUID processing) ───────────────────────────
+
+def process_pending_requests(config: ReplicationConfig) -> int:
+    """
+    Fetch a batch of PENDING/retryable FAILED requests and process them in parallel.
+
+    Scalability changes vs sequential version:
+      1. Marks entire batch IN_PROGRESS in ONE UPDATE (not N updates)
+      2. Processes all UUIDs in parallel via ThreadPoolExecutor (uuid_workers threads)
+      3. Each UUID copies its files in parallel (file_workers threads)
+      4. Writes all results back in ONE MERGE at the end (not N updates)
+    """
+    full_table = f"{config.tracking_schema}.{config.tracking_table}"
+
+    pending_df = spark.sql(f"""
+        SELECT request_id, source_bucket, source_key, dest_path, retry_count
+        FROM {full_table}
+        WHERE status = 'PENDING'
+           OR (status = 'FAILED' AND retry_count < {config.max_retries})
+        ORDER BY created_timestamp ASC
+        LIMIT {config.batch_size}
+    """)
+
+    rows = [row.asDict() for row in pending_df.collect()]
+
+    if not rows:
+        logger.info("No pending replication requests found.")
+        return 0
+
+    logger.info(f"Processing {len(rows)} UUID folders with {config.uuid_workers} parallel workers...")
+
+    # Step 1 — Mark entire batch IN_PROGRESS in one shot
+    request_ids = [r['request_id'] for r in rows]
+    mark_batch_in_progress(config, request_ids)
+
+    # Step 2 — Process all UUIDs in parallel
+    # Each UUID runs replicate_uuid_folder() in its own thread
+    results = []
+    with ThreadPoolExecutor(max_workers=config.uuid_workers) as uuid_executor:
+        future_to_row = {
+            uuid_executor.submit(replicate_uuid_folder, config, row): row
+            for row in rows
+        }
+
+        for future in as_completed(future_to_row):
+            row = future_to_row[future]
+            try:
+                result = future.result()
+                results.append(result)
+                logger.info(
+                    f"[{result['status']}] {result['request_id']} — "
+                    f"{result['files_copied']} files, {result['total_bytes']} bytes"
+                    + (f" | {result['error_message']}" if result['error_message'] else "")
+                )
+            except Exception as e:
+                # Unexpected thread-level failure — shouldn't happen but handle safely
+                logger.error(f"Thread crashed for UUID {row['request_id']}: {e}", exc_info=True)
+                results.append({
+                    'request_id'   : row['request_id'],
+                    'status'       : ReplicationStatus.FAILED.value,
+                    'files_copied' : 0,
+                    'total_bytes'  : 0,
+                    'error_message': f"Thread crashed: {str(e)}"
+                })
+
+    # Step 3 — Write ALL results back in ONE MERGE (not N individual updates)
+    batch_update_status(config, results)
+
+    successful = sum(1 for r in results if r['status'] == ReplicationStatus.COMPLETED.value)
+    skipped    = sum(1 for r in results if r['status'] == ReplicationStatus.SKIPPED.value)
+    failed     = sum(1 for r in results if r['status'] == ReplicationStatus.FAILED.value)
+
+    logger.info(f"Batch done — Completed: {successful} | Skipped: {skipped} | Failed: {failed}")
+    return successful
+
+
+# COMMAND ----------
+
+# ── Summary ────────────────────────────────────────────────────────────────────
+
+def print_summary(config: ReplicationConfig):
+    """Print a summary grouped by status, plus a SKIPPED breakdown showing why."""
+    full_table = f"{config.tracking_schema}.{config.tracking_table}"
+
+    print("\n===== S3 Replication Summary =====")
+    spark.sql(f"""
+        SELECT
+            status,
+            COUNT(*)          AS request_count,
+            SUM(files_copied) AS total_files,
+            ROUND(SUM(total_bytes) / 1024 / 1024, 2) AS total_mb
+        FROM {full_table}
+        GROUP BY status
+        ORDER BY status
+    """).show(truncate=False)
+
+    print("\n===== SKIPPED Breakdown (Why?) =====")
+    # Shows clearly: how many UUIDs were missing from S3 vs how many had empty folders
+    spark.sql(f"""
+        SELECT
+            error_message AS skip_reason,
+            COUNT(*)      AS count
+        FROM {full_table}
+        WHERE status = 'SKIPPED'
+        GROUP BY error_message
+        ORDER BY error_message
+    """).show(truncate=False)
+
+    print("\n===== FAILED Details =====")
+    spark.sql(f"""
+        SELECT
+            request_id,
+            file_name,
+            error_message,
+            retry_count
+        FROM {full_table}
+        WHERE status = 'FAILED'
+        ORDER BY completed_timestamp DESC
+        LIMIT 20
+    """).show(truncate=False)
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 12
+# ── Entry Point ────────────────────────────────────────────────────────────────
+
+def main():
+    config = ReplicationConfig()
+    logger.info("=== S3 Replication Job Started ===")
+
+    # 1. Create Delta tracking table if not exists
+    init_tracking_table(config)
+
+    # 2. Insert new UUIDs from silver table as PENDING (incremental, idempotent)
+    populate_pending_requests(config)
+
+    # 3. Process batch in parallel — UUID-level + file-level parallelism
+    successful = process_pending_requests(config)
+
+    # 4. Print summary with SKIPPED breakdown
+    print_summary(config)
+
+    logger.info(f"=== Job Completed: {successful} UUID folder(s) replicated ===")
+
+
+main()
+
+# COMMAND ----------
+
+spark.sql("""
+    DELETE FROM dbx_dev_data_refine.export.s3_replication_requests
+    WHERE status = 'SKIPPED'
+""")
+
+# COMMAND ----------
+
+folders = [item for item in dbutils.fs.ls("/Volumes/dbx_dev_data_refine/export/ereg/s3_replication/eReg_QA") if item.isDir()]
+count = len(folders)
+display(count)
+
+# COMMAND ----------
+
+folders = [item for item in dbutils.fs.ls("/Volumes/dbx_dev_data_refine/export/ereg/s3_replication/eReg_sandbox") if item.isDir()]
+count = len(folders)
+display(count)
