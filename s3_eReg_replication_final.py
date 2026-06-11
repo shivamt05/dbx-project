@@ -1,9 +1,4 @@
 # Databricks notebook source
-# %sql
-# #select * from dbx_dev_data_refine.export.s3_replication_requests_1 where status='COMPLETED' ;
-
-# COMMAND ----------
-
 # MAGIC %md ## Cell 1 — Install
 
 # COMMAND ----------
@@ -48,49 +43,150 @@ print("✅ Imports done")
 
 # COMMAND ----------
 
+# ── Widgets ────────────────────────────────────────────────────────────────────
+# Defaults = dev values.
+# When run via Databricks Job → job overwrites these via base_parameters.
+# When run manually in notebook UI → defaults below are used.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Source S3
+dbutils.widgets.text("source_bucket",       "qa-ereg-us-east-2-ses-qa-ereg",
+                     "Source S3 Bucket")
+dbutils.widgets.text("source_prefix",       "sw1-qa-ereg",
+                     "Source S3 Prefix")
+dbutils.widgets.text("source_ext_location", "s3://qa-ereg-us-east-2-ses-qa-ereg/sw1-qa-ereg",
+                     "Source External Location")
+dbutils.widgets.text("aws_region",          "us-east-2",
+                     "AWS Region")
+
+# Destination Volume
+dbutils.widgets.text("dest_volume_path",    "/Volumes/dbx_dev_data_refine/export/cc_refine/test",
+                     "Destination Volume Path")
+
+# Silver table
+dbutils.widgets.text("silver_table",        "dbx_dev_data_refine.ereg_silver.s3_file",
+                     "Silver Table")
+
+# Tracking table
+dbutils.widgets.text("tracking_schema",     "dbx_dev_data_refine.export",
+                     "Tracking Schema")
+dbutils.widgets.text("tracking_table",      "s3_replication_requests_2",
+                     "Tracking Table")
+
+# Scalability knobs
+dbutils.widgets.text("batch_size",          "800",   "Batch Size")
+dbutils.widgets.text("max_retries",         "3",     "Max Retries")
+dbutils.widgets.text("uuid_workers",        "10",    "UUID Workers")
+dbutils.widgets.text("file_workers",        "5",     "File Workers")
+
+
+# ── Config dataclass — reads from widgets ──────────────────────────────────────
 @dataclass
 class ReplicationConfig:
 
-    # ── Source S3 (read only) ──────────────────────────────────────────────────
-    source_bucket:       str = "qa-ereg-us-east-2-ses-qa-ereg"
-    source_prefix:       str = "sw1-qa-ereg"      # files at s3://<bucket>/<prefix>/<uuid>/
-    source_ext_location: str = "s3://qa-ereg-us-east-2-ses-qa-ereg/sw1-qa-ereg"
-    aws_region:          str = "us-east-2"
+    # Source S3
+    source_bucket:        str
+    source_prefix:        str
+    source_ext_location:  str
+    aws_region:           str
 
-    # ── Destination: Unity Catalog Volume ─────────────────────────────────────
-    # boto3 s3.copy_object() failed — PutObject denied on dest bucket policy.
-    # Solution: write to UC Volume via get_object + open().
-    # UC Volume uses Databricks-managed internal credentials — bypasses deny.
-    dest_volume_path:    str = "/Volumes/dbx_dev_data_refine/export/cc_refine/refine"
+    # Destination Volume
+    dest_volume_path:     str
 
-    # ── Silver table that drives replication ──────────────────────────────────
-    silver_table:        str = "dbx_dev_data_refine.ereg_silver.s3_file"
+    # Silver table
+    silver_table:         str
 
-    # ── Delta tracking table ───────────────────────────────────────────────────
-    tracking_schema:     str = "dbx_dev_data_refine.export"
-    tracking_table:      str = "s3_replication_requests_2"
+    # Tracking table
+    tracking_schema:      str
+    tracking_table:       str
 
-    # ── Scalability knobs ──────────────────────────────────────────────────────
-    batch_size:          int = 800    # UUID folders per run
-    max_retries:         int = 3      # retry attempts per UUID
-    uuid_workers:        int = 10     # parallel threads — UUID level
-    file_workers:        int = 5      # parallel threads — file level per UUID
+    # Scalability
+    batch_size:           int
+    max_retries:          int
+    uuid_workers:         int
+    file_workers:         int
 
-    # ── Chunk size — ONE value used for BOTH streaming copy AND SHA256 ─────────
-    # 8MB balances memory usage vs syscall overhead for streaming
-    # Same chunk used for copy and checksum — file streamed only ONCE
-    chunk_size:          int = 8 * 1024 * 1024   # 8MB
+    # Chunk size — fixed, not a widget (no reason to change per env)
+    chunk_size:           int = 8 * 1024 * 1024   # 8MB
 
 
-config = ReplicationConfig()
+def load_config() -> ReplicationConfig:
+    """
+    Read all widget values and return a populated ReplicationConfig.
+    Called once at startup — any job parameter override is picked up here.
+    """
+    return ReplicationConfig(
+        source_bucket        = dbutils.widgets.get("source_bucket"),
+        source_prefix        = dbutils.widgets.get("source_prefix"),
+        source_ext_location  = dbutils.widgets.get("source_ext_location"),
+        aws_region           = dbutils.widgets.get("aws_region"),
+        dest_volume_path     = dbutils.widgets.get("dest_volume_path"),
+        silver_table         = dbutils.widgets.get("silver_table"),
+        tracking_schema      = dbutils.widgets.get("tracking_schema"),
+        tracking_table       = dbutils.widgets.get("tracking_table"),
+        batch_size           = int(dbutils.widgets.get("batch_size")),
+        max_retries          = int(dbutils.widgets.get("max_retries")),
+        uuid_workers         = int(dbutils.widgets.get("uuid_workers")),
+        file_workers         = int(dbutils.widgets.get("file_workers")),
+    )
 
-print("Config loaded:")
-print(f"  Source  : s3://{config.source_bucket}/{config.source_prefix}/")
-print(f"  Dest    : {config.dest_volume_path}/")
-print(f"  Silver  : {config.silver_table}")
-print(f"  Tracking: {config.tracking_schema}.{config.tracking_table}")
-print(f"  Workers : {config.uuid_workers} UUID × {config.file_workers} file | Batch: {config.batch_size}")
-print(f"  Chunk   : {config.chunk_size // (1024*1024)}MB per chunk")
+
+config = load_config()
+
+print("Config loaded from widgets:")
+print(f"  Source        : s3://{config.source_bucket}/{config.source_prefix}/")
+print(f"  Dest          : {config.dest_volume_path}/")
+print(f"  Silver        : {config.silver_table}")
+print(f"  Tracking      : {config.tracking_schema}.{config.tracking_table}")
+print(f"  Batch         : {config.batch_size} | UUID workers: {config.uuid_workers} | File workers: {config.file_workers}")
+print(f"  Chunk         : {config.chunk_size // (1024*1024)}MB per chunk")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC @dataclass
+# MAGIC class ReplicationConfig:
+# MAGIC
+# MAGIC     # ── Source S3 (read only) ──────────────────────────────────────────────────
+# MAGIC     source_bucket:       str = "qa-ereg-us-east-2-ses-qa-ereg"
+# MAGIC     source_prefix:       str = "sw1-qa-ereg"      # files at s3://<bucket>/<prefix>/<uuid>/
+# MAGIC     source_ext_location: str = "s3://qa-ereg-us-east-2-ses-qa-ereg/sw1-qa-ereg"
+# MAGIC     aws_region:          str = "us-east-2"
+# MAGIC
+# MAGIC     # ── Destination: Unity Catalog Volume ─────────────────────────────────────
+# MAGIC     # boto3 s3.copy_object() failed — PutObject denied on dest bucket policy.
+# MAGIC     # Solution: write to UC Volume via get_object + open().
+# MAGIC     # UC Volume uses Databricks-managed internal credentials — bypasses deny.
+# MAGIC     dest_volume_path:    str = "/Volumes/dbx_dev_data_refine/export/cc_refine/refine"
+# MAGIC
+# MAGIC     # ── Silver table that drives replication ──────────────────────────────────
+# MAGIC     silver_table:        str = "dbx_dev_data_refine.ereg_silver.s3_file"
+# MAGIC
+# MAGIC     # ── Delta tracking table ───────────────────────────────────────────────────
+# MAGIC     tracking_schema:     str = "dbx_dev_data_refine.export"
+# MAGIC     tracking_table:      str = "s3_replication_requests_2"
+# MAGIC
+# MAGIC     # ── Scalability knobs ──────────────────────────────────────────────────────
+# MAGIC     batch_size:          int = 800    # UUID folders per run
+# MAGIC     max_retries:         int = 3      # retry attempts per UUID
+# MAGIC     uuid_workers:        int = 10     # parallel threads — UUID level
+# MAGIC     file_workers:        int = 5      # parallel threads — file level per UUID
+# MAGIC
+# MAGIC     # ── Chunk size — ONE value used for BOTH streaming copy AND SHA256 ─────────
+# MAGIC     # 8MB balances memory usage vs syscall overhead for streaming
+# MAGIC     # Same chunk used for copy and checksum — file streamed only ONCE
+# MAGIC     chunk_size:          int = 8 * 1024 * 1024   # 8MB
+# MAGIC
+# MAGIC
+# MAGIC config = ReplicationConfig()
+# MAGIC
+# MAGIC print("Config loaded:")
+# MAGIC print(f"  Source  : s3://{config.source_bucket}/{config.source_prefix}/")
+# MAGIC print(f"  Dest    : {config.dest_volume_path}/")
+# MAGIC print(f"  Silver  : {config.silver_table}")
+# MAGIC print(f"  Tracking: {config.tracking_schema}.{config.tracking_table}")
+# MAGIC print(f"  Workers : {config.uuid_workers} UUID × {config.file_workers} file | Batch: {config.batch_size}")
+# MAGIC print(f"  Chunk   : {config.chunk_size // (1024*1024)}MB per chunk")
 
 # COMMAND ----------
 
@@ -692,6 +788,7 @@ def process_pending_requests(config: ReplicationConfig,
         SELECT request_id, source_bucket, source_key, retry_count
         FROM {full_table}
         WHERE status = 'PENDING'
+           OR status = 'SKIPPED'
            OR (status = 'FAILED' AND retry_count < {config.max_retries})
         ORDER BY created_timestamp ASC
         LIMIT {config.batch_size}
@@ -809,7 +906,7 @@ def main():
     logger.info("=== S3-to-Volume Replication Job Started ===")
     print("=== S3-to-Volume Replication Job Started ===\n")
 
-    config = ReplicationConfig()
+    config = load_config()
 
     # 1. Create Delta tracking table
     init_tracking_table(config)
@@ -830,47 +927,3 @@ def main():
 
 
 main()
-
-# COMMAND ----------
-
-# MAGIC %md ## Cell 13 — Utility Queries (run manually when needed)
-
-# COMMAND ----------
-
-# Check tracking table status counts
-spark.sql(f"""
-    SELECT status, COUNT(*) AS count
-    FROM {config.tracking_schema}.{config.tracking_table}
-    GROUP BY status
-""").show()
-
-# COMMAND ----------
-
-#Check completed records with checksum
-spark.sql(f"""
-    SELECT request_id, file_name, checksum, duration_seconds, completed_timestamp
-    FROM {config.tracking_schema}.{config.tracking_table}
-    WHERE status = 'COMPLETED'
-    ORDER BY completed_timestamp DESC
-    LIMIT 10
-""").show(truncate=False)
-
-# COMMAND ----------
-
-#Count UUID folders at destination S3
-paginator = dest_client.get_paginator('list_objects_v2')
-uuids = set()
-for page in paginator.paginate(Bucket=config.dest_bucket,
-                               Prefix=config.dest_prefix + "/",
-                               Delimiter="/"):
-    for p in page.get('CommonPrefixes', []):
-        uuids.add(p['Prefix'])
-print(f"UUID folders at destination: {len(uuids)}")
-
-# COMMAND ----------
-
-# Clear SKIPPED rows to retry — uncomment manually when needed
-# spark.sql(f"""
-#     DELETE FROM {config.tracking_schema}.{config.tracking_table}
-#     WHERE status = 'SKIPPED'
-# """)

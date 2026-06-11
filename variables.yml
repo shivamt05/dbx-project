@@ -1,0 +1,134 @@
+# common variables used across different environments
+# see https://docs.databricks.com/dev-tools/bundles/configure.html#variables
+variables:
+  env:
+    description: Deployment environment (dev, stg, prd)
+    default: "dev"
+  env_prefix:
+    description: Prefix for environment-specific resources
+    default: "app_${var.env}_scapi"
+  user:
+    description: Principal deploying the bundle (human user or service principal). Defaults to the current workspace user.
+    default: "${workspace.current_user.userName}"
+  user_prefix:
+    description: Prefix derived from the deployer principal to use for resource names (defaults to current workspace user's short name).
+    default: "${workspace.current_user.short_name}"
+  file_path:
+    description: Path to data files
+    default: "${workspace.file_path}"
+
+   # Groups and Service Principals
+  sp_admin:
+    description: Service principal used for admin tasks like workspace deployment
+    default: "${var.env_prefix}_sp_admin"
+  sp_etl:
+    description: Service principal used to run jobs/pipelines/ETL
+    default: "${var.env_prefix}_sp_etl"
+
+
+  ug_admin:
+    description: Admin group name (infra team)
+    default: "${var.env_prefix}_ug_admin"
+  ug_ops:
+    description: Operations group name (monitor jobs and adhoc runs)
+    default: "${var.env_prefix}_ug_ops"
+  ug_developer:
+    description: Data Engineers group name
+    default: "${var.env_prefix}_ug_developer"
+  ug_tester:
+    description: Data Testers group name (QA team)
+    default: "${var.env_prefix}_ug_tester"
+  ug_reader:
+    description: Data Readers group name (read-only access for analysts, data scientists, etc.)
+    default: "${var.env_prefix}_ug_reader"
+  ug_etl:
+    description: ETL group name (for service principals running ETL jobs)
+    default: "${var.env_prefix}_ug_etl"
+
+  # Catalogs and Schemas
+  poc_cc_catalog:
+    description: The Unity Catalog to use for this environment
+    default: "poc_cc"
+  silver_schema:
+    description: Source schema containing input tables (canonical, icon_silver)
+    default: "${var.env}_silver"
+  canonical_scoring_hitl_schema:
+    description: Target schema for scoring output tables
+    default: "canonical_scoring_hitl"
+
+  # Gold Tables - Target
+  target_catalog:
+    description: Target catalog for gold and stage tables
+    default: "app_${var.env}_scapi_data"
+  gold_schema:
+    description: Gold layer schema
+    default: "gold"
+  stage_schema:
+    description: Stage layer schema
+    default: "stage"
+
+  # Gold Tables - Source
+  source_catalog:
+    description: Source catalog for silver layer tables
+    default: "dbx_${var.env}_data_refine"
+  ereg_silver_schema:
+    description: eReg silver sandbox schema
+    default: "ereg_silver_sandbox"
+  cc_silver_schema:
+    description: CC silver sandbox schema
+    default: "cc_silver_sandbox"
+
+  # libraries
+  scapi_app_utils:
+    description: The dbx_cc_utils wheel artifact built from this bundle
+    default: "/Workspace/Shared/Artifacts/scapi_app-1.0.0-py3-none-any.whl"
+
+  # Job Schedule
+  job_schedule_status:
+    description: Pause status for scheduled jobs (PAUSED or UNPAUSED)
+    default: "PAUSED"
+  # ── S3 Replication Variables ───────────────────────────────────────────────────
+  ereg_QA_silver_table:
+    description: Silver table that drives eReg replication (contains s3_file_id UUIDs)
+    default: "dbx_${var.env}_data_refine.ereg_silver.s3_file"
+  ereg_sandbox_silver_table:
+    description: Silver table that drives eReg replication (contains s3_file_id UUIDs)
+    default: "dbx_${var.env}_data_refine.ereg_silver_sandbox.s3_file"
+
+  # ── Destination Volume ────────────────────────────────────────────────────────
+  eregQA_dest_volume_path:
+    description: UC Volume destination path where replicated files will land
+    default: "/Volumes/dbx_${var.env}_data_refine/export/eReg/eRegQA"
+  
+  ereg_sandbox_dest_volume_path:
+    description: UC Volume destination path where replicated files will land
+    default: "/Volumes/dbx_${var.env}_data_refine/export/eReg/eReg_sandbox"
+
+  # ── Tracking Delta Table ──────────────────────────────────────────────────────
+  ereg_tracking_schema:
+    description: Delta table schema for S3 replication tracking table
+    default: "dbx_${var.env}_data_refine.export"
+
+  ereg_tracking_table:
+    description: Delta table name for S3 replication tracking
+    default: "s3_replication_requests"
+
+  # Clusters
+  job_cluster_policy_id:
+    description: The cluster policy ID for dbt jobs
+    default: "001610FEDE7C5A8C"
+
+  #cluster_id:
+  #  description: The cluster ID for development jobs
+  #  lookup:
+  #    cluster: "${var.env}_shared_cluster"
+    
+  #scapi_job_cluster_id:
+  #  description: The cluster ID for development jobs
+  #  lookup:
+  #    cluster: "${var.env}_cc_job_cluster"
+
+  cluster_id:
+    description: The cluster ID for development jobs
+    lookup:
+      cluster: "${var.env}_shared_cluster"

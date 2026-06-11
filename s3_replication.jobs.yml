@@ -1,0 +1,81 @@
+resources:
+  jobs:
+    s3_ereg_document_replication:
+      name: s3_ereg_document_replication
+      description: job to replicate eReg documents from s3 to databricks
+      #run_as:
+      # service_principal_name: "${var.sp_etl}"
+
+      schedule:
+        quartz_cron_expression: 0 0 * * * ?
+        timezone_id: Asia/Calcutta
+        pause_status: ${var.job_schedule_status} 
+      max_concurrent_runs: 1
+      queue:
+        enabled: true  # This ensures runs are queued instead of skipped
+
+      tags:
+        "env": "${var.env}"
+        "bundle": "${bundle.name}"
+        "product": "s3"
+        "job_type": "s3 file replication"
+                
+      parameters:
+        - name: env
+          default: ${var.env}
+        - name: libraries
+          default: "${var.scapi_app_utils}"
+        - name: job_id
+          default: "{{job.id}}" # Placeholder for the job ID to be used in task creation
+        - name: run_id
+          default: "{{job.run_id}}" # Placeholder for the run ID to be used in task creation
+          
+        
+        
+      job_clusters:
+        - job_cluster_key: s3_replication_cluster
+          new_cluster: ${var.silver_cluster_config}
+
+      tasks:
+        - task_key: s3_replication_eReg_Sandbox
+          description: replication of s3 files in databricks volume
+          job_cluster_key: s3_replication_cluster
+          notebook_task:
+            notebook_path: ${var.file_path}/src/S3 Replication/s3_eReg_replication_final     
+            base_parameters:
+                notebook_path: ${var.file_path}/src/S3 Replication/s3_eReg_replication_final
+                job_cluster_key: s3_replication_cluster
+                source_bucket: "stg-forte-us-east-2-forte-ses-inbound"
+                source_prefix: "icon-ereg-stg"
+                source_ext_location: s3://stg-forte-us-east-2-forte-ses-inbound/icon-ereg-stg
+                aws_region: "us-east-2"
+                dest_volume_path:    ${var.ereg_sandbox_dest_volume_path}
+                # Silver table — env specific
+                silver_table:        ${var.ereg_sandbox_silver_table}
+                # Tracking table — env specific
+                tracking_schema:     ${var.ereg_tracking_schema}
+                tracking_table:      ${var.ereg_tracking_table} 
+
+
+        - task_key: s3_replication_eReg_QA
+          depends_on:
+            - task_key: s3_replication_eReg_Sandbox
+          description: replication of s3 files in databricks volume
+          job_cluster_key: s3_replication_cluster
+          notebook_task:
+            notebook_path: ${var.file_path}/src/S3 Replication/s3_eReg_replication_final     
+            base_parameters:
+                notebook_path: ${var.file_path}/src/S3 Replication/s3_eReg_replication_final
+                job_cluster_key: s3_replication_cluster
+                source_bucket: "qa-ereg-us-east-2-ses-qa-ereg"
+                source_prefix: "sw1-qa-ereg"
+                source_ext_location: "s3://qa-ereg-us-east-2-ses-qa-ereg/sw1-qa-ereg"
+                aws_region: "us-east-2"
+                dest_volume_path:    ${var.eregQA_dest_volume_path}
+                # Silver table — env specific
+                silver_table:        ${var.ereg_QA_silver_table}
+                # Tracking table — env specific
+                tracking_schema:     ${var.ereg_tracking_schema}
+                tracking_table:      ${var.ereg_tracking_table}
+
+               
